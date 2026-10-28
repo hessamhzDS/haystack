@@ -2,17 +2,57 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import copyreg
 import heapq
 from collections.abc import Callable
 from copy import deepcopy
 from functools import wraps
 from itertools import count
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from haystack import logging
 from haystack.core.component import Component
 
+if TYPE_CHECKING:
+    from haystack.dataclasses import Document
+
 logger = logging.getLogger(__name__)
+
+# Immutable built-in types that `deepcopy` returns unchanged. Matching the exact type (not `isinstance`) keeps
+# subclasses, which can customize copying, on the regular path.
+_IMMUTABLE_ATOMIC_TYPES = frozenset({type(None), bool, int, float, complex, str, bytes})
+
+# Instance attributes that `deepcopy` or the `Component` protocol check would pick up from a Document's `__dict__`.
+# Documents that have any of them take the regular path.
+_DOCUMENT_FAST_PATH_EXCLUDED_ATTRIBUTES = frozenset({"run", "__deepcopy__", "__reduce_ex__"})
+
+
+def _deepcopy_document(document: "Document") -> "Document":
+    """
+    Return the same result as `deepcopy(document)`, faster.
+
+    Like `deepcopy`, it creates the instance without calling `__init__` and deep-copies its `__dict__` with one shared
+    memo. The difference is that lists holding only immutable built-ins, such as embeddings, are copied in one step
+    instead of element by element. Registering every copy in the memo keeps aliasing between attributes the same as
+    `deepcopy` would.
+    """
+    # Import here to avoid circular imports
+    from haystack.dataclasses import Document
+
+    memo: dict[int, Any] = {}
+    copied = Document.__new__(Document)
+    memo[id(document)] = copied
+    state: dict[str, Any] = {}
+    memo[id(document.__dict__)] = state
+    for name, value in document.__dict__.items():
+        if type(value) is list and set(map(type, value)) <= _IMMUTABLE_ATOMIC_TYPES:
+            if id(value) not in memo:
+                memo[id(value)] = list(value)
+            state[name] = memo[id(value)]
+        else:
+            state[name] = deepcopy(value, memo)
+    copied.__dict__.update(state)
+    return copied
 
 
 def _deepcopy_with_exceptions(obj: Any) -> Any:
@@ -29,7 +69,13 @@ def _deepcopy_with_exceptions(obj: Any) -> Any:
     :returns:
         A deep-copied version of the object, or the original object if deepcopying fails.
     """
+    # Skips the `Component` protocol check below, which is slow and would otherwise run on every leaf value,
+    # such as each float of an embedding.
+    if type(obj) in _IMMUTABLE_ATOMIC_TYPES:
+        return obj
+
     # Import here to avoid circular imports
+    from haystack.dataclasses import Document
     from haystack.tools.tool import Tool
     from haystack.tools.toolset import Toolset
 
@@ -44,13 +90,21 @@ def _deepcopy_with_exceptions(obj: Any) -> Any:
     if isinstance(obj, dict):
         return {k: _deepcopy_with_exceptions(v) for k, v in obj.items()}
 
+    # A plain Document can only match the `Component` protocol or customize `deepcopy` through attributes set on the
+    # instance or a `copyreg` reducer, so this skips the slow protocol check without changing the result.
+    is_plain_document = (
+        type(obj) is Document
+        and _DOCUMENT_FAST_PATH_EXCLUDED_ATTRIBUTES.isdisjoint(obj.__dict__)
+        and Document not in copyreg.dispatch_table
+    )
+
     # Components and Tools often contain objects that we do not want to deepcopy or are not deepcopyable
     # (e.g. models, clients, etc.). In this case we return the object as-is.
-    if isinstance(obj, (Component, Tool, Toolset)):
+    if not is_plain_document and isinstance(obj, (Component, Tool, Toolset)):
         return obj
 
     try:
-        return deepcopy(obj)
+        return _deepcopy_document(obj) if is_plain_document else deepcopy(obj)
     except Exception as e:
         logger.info(
             "Deepcopy failed for object of type '{obj_type}'. Error: {error}. Returning original object instead.",
